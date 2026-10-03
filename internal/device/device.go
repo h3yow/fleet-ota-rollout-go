@@ -47,6 +47,10 @@ func (e Effect) String() string {
 // Result 描述一次事件处理的判定依据，便于日志解释。
 type Result struct {
 	Accepted bool
+	// Fresh 表示该事件通过了序号闸门（seq > LastSeq），
+	// 是设备此刻真实可达的证据；重复/迟到重放 Fresh=false。
+	// 即使事件因状态机/版本原因被拒绝，只要序号新鲜就证明设备存活。
+	Fresh    bool
 	Reason   string
 	OldPhase model.DevicePhase
 	NewPhase model.DevicePhase
@@ -92,6 +96,8 @@ func ApplyEvent(d *model.DeviceState, ev model.Event) Result {
 		res.Reason = fmt.Sprintf("stale seq %d <= lastSeq %d: duplicate or out-of-order, dropped", ev.Seq, d.LastSeq)
 		return res
 	}
+	// 通过序号闸门即视为新鲜上报：设备此刻真实可达，可用于恢复在线。
+	res.Fresh = true
 
 	// 心跳与重连：只维护在线性与序号，不改变升级阶段。
 	if ev.Type == model.EventHeartbeat || ev.Type == model.EventReconnect {

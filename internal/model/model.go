@@ -95,14 +95,48 @@ type DeviceState struct {
 	AttemptID uint64
 	// LastSeq 已处理的最大事件序号，用于丢弃迟到/乱序上报。
 	LastSeq uint64
-	// Online 设备是否在线（由心跳/重连维护）。
+	// Online 设备是否在线（由心跳/重连与编排侧存活巡检共同维护）。
 	Online bool
+	// LastContactAt 编排侧最近一次收到该设备任意上报的时间（存活依据）。
+	LastContactAt time.Time
+	// DispatchedAt 当前在途尝试最近一次派发的时间（在途回收等待窗口依据）。
+	// 设备不在在途尝试中时为零值。
+	DispatchedAt time.Time
 }
 
 // CanDispatch 设备当前是否可被派发：处于空闲/失败终态。
 // 在线性由编排侧在派发前另行检查（离线设备不应被派发）。
 func (d *DeviceState) CanDispatch() bool {
 	return d.Phase == PhaseIdle || d.Phase == PhaseFailed
+}
+
+// ContactTimedOut 判定在 now 时刻设备是否已超过心跳超时窗口：
+// 自最近一次上报起严格经过超过 timeout 的时长。
+// 窗口为 0 表示不启用心跳判定；从未有过上报记录时，只要启用窗口即视为超时。
+// 边界取严格大于：刚好等于窗口时仍算在线。
+func (d *DeviceState) ContactTimedOut(now time.Time, timeout time.Duration) bool {
+	if timeout <= 0 {
+		return false
+	}
+	if d.LastContactAt.IsZero() {
+		return true
+	}
+	return now.Sub(d.LastContactAt) > timeout
+}
+
+// Inflight 设备是否持有一条已派发但未出结果的在途尝试。
+func (d *DeviceState) Inflight() bool {
+	return d.Phase == PhaseAssigned || d.Phase == PhaseUpdating
+}
+
+// InflightTimedOut 判定在途尝试是否已超过在途等待窗口：
+// 自派发时刻起严格经过超过 wait 的时长仍无任何结果。
+// wait 为 0 表示不启用在途回收；无派发时间记录时不回收。
+func (d *DeviceState) InflightTimedOut(now time.Time, wait time.Duration) bool {
+	if wait <= 0 || d.DispatchedAt.IsZero() || !d.Inflight() {
+		return false
+	}
+	return now.Sub(d.DispatchedAt) > wait
 }
 
 // BatchState 是批次生命周期状态。

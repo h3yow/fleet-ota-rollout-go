@@ -130,15 +130,15 @@ func TestDuplicateDispatchIdempotent(t *testing.T) {
 
 func TestCircuitBreakStopsRollout(t *testing.T) {
 	svc := newService(t, 4)
-	// 阈值 0.5：1 成功 1 失败即达 0.5 触发熔断。
+	// 阈值 0.5：失败率恰好 0.5 时不熔断，严格超过（如 2/3≈0.67）才熔断。
 	if err := svc.CreateBatch("b1", v2, []float64{1}, 4, 0.5); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.StartBatch("b1"); err != nil {
 		t.Fatal(err)
 	}
-	// 初始只派发两台，熔断后第三台必须无法派发。
-	for _, dev := range []string{"dev-0", "dev-1"} {
+	// 先派发三台：1 成功 1 失败（回滚完成）时失败率恰好 0.5，必须继续投放。
+	for _, dev := range []string{"dev-0", "dev-1", "dev-2"} {
 		if err := svc.Dispatch("b1", dev); err != nil {
 			t.Fatalf("dispatch %s: %v", dev, err)
 		}
@@ -146,7 +146,7 @@ func TestCircuitBreakStopsRollout(t *testing.T) {
 	if _, err := svc.Ingest(succeedEvent("dev-0", 1, "b1", 1)); err != nil {
 		t.Fatal(err)
 	}
-	// dev-1 失败并回滚完成。
+	// dev-1 失败并回滚完成：此刻 1 成 1 败 = 0.5，恰好等于阈值，不得熔断。
 	if _, err := svc.Ingest(model.Event{DeviceID: "dev-1", Seq: 1, Type: model.EventUpdateFailed, BatchID: "b1", AttemptID: 1, Reason: "flash error"}); err != nil {
 		t.Fatal(err)
 	}
@@ -154,16 +154,48 @@ func TestCircuitBreakStopsRollout(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, b := svc.Snapshot("dev-0", "b1")
-	t.Logf("batch after failure: state=%s failed=%d succeeded=%d rolledBack=%d failureRate=%.2f",
+	if b.State != model.BatchRolling {
+		t.Fatalf("failure rate exactly at threshold must keep rolling, got %s", b.State)
+	}
+	// 阈值边界上仍要继续投放：dev-3 此时可派发（阶段配额为 4）。
+	if err := svc.Dispatch("b1", "dev-3"); err != nil {
+		t.Fatalf("equal-threshold must still allow dispatch: %v", err)
+	}
+	// dev-2 也失败：2 成 1 败 = 1/3；再让 dev-3 失败 -> 1 成 2 败 = 2/3 严格超过 0.5，熔断。
+	failAndRollback := func(dev string) {
+		if _, err := svc.Ingest(model.Event{DeviceID: dev, Seq: 1, Type: model.EventUpdateFailed, BatchID: "b1", AttemptID: 1, Reason: "flash error"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := svc.Ingest(model.Event{DeviceID: dev, Seq: 2, Type: model.EventRollbackDone, Version: v1, BatchID: "b1", AttemptID: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// dev-2 失败：1 成 2 败 = 2/3 严格超过 0.5，熔断。
+	failAndRollback("dev-2")
+	_, b = svc.Snapshot("dev-0", "b1")
+	if b.State != model.BatchCircuitBroken {
+		t.Fatalf("rate 2/3 strictly exceeds threshold, must trip, got %s", b.State)
+	}
+	// 熔断后 dev-3 的失败结果仍必须正常入账：设备完成回滚收敛，
+	// 批次不“恢复/完成”，但计数继续推进。
+	failAndRollback("dev-3")
+	_, b = svc.Snapshot("dev-0", "b1")
+	t.Logf("batch after failures: state=%s failed=%d succeeded=%d rolledBack=%d failureRate=%.2f",
 		b.State, b.Failed, b.Succeeded, b.RolledBack, b.FailureRate())
 	if b.State != model.BatchCircuitBroken {
-		t.Fatalf("batch must be circuit broken, got %s", b.State)
+		t.Fatalf("post-break results must not un-break/complete batch, got %s", b.State)
 	}
-	if b.Failed != 1 || b.RolledBack != 1 {
-		t.Fatalf("bad counters: %+v", b)
+	if b.Failed != 3 || b.RolledBack != 3 {
+		t.Fatalf("post-break results must still be counted: %+v", b)
+	}
+	if d3, _ := svc.Snapshot("dev-3", "b1"); d3.Phase != model.PhaseFailed || !d3.CurrentVersion.Equal(v1) {
+		t.Fatalf("post-break failure must converge via rollback: %+v", d3)
 	}
 	// 熔断后后续设备不得再被派发。
-	if err := svc.Dispatch("b1", "dev-2"); err == nil {
+	if err := svc.RegisterDevice("dev-extra", v1); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Dispatch("b1", "dev-extra"); err == nil {
 		t.Fatal("circuit-broken batch must not dispatch")
 	}
 	// 暂停/恢复都不能解除熔断。

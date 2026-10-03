@@ -13,8 +13,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/h3yow/fleet-ota-rollout-go/internal/batch"
+	"github.com/h3yow/fleet-ota-rollout-go/internal/clock"
 	"github.com/h3yow/fleet-ota-rollout-go/internal/device"
 	"github.com/h3yow/fleet-ota-rollout-go/internal/model"
 	"github.com/h3yow/fleet-ota-rollout-go/internal/store"
@@ -35,12 +37,19 @@ type Service struct {
 	bm  *batch.Manager
 	reg *device.Registry
 	log func(format string, args ...any)
+
+	// 存活巡检与在途回收配置（0 表示对应判定关闭）。
+	clk              clock.Clock
+	heartbeatTimeout time.Duration
+	inflightTimeout  time.Duration
 }
 
-// New 创建编排服务。
+// New 创建编排服务。默认使用系统时钟，存活/回收窗口默认关闭，
+// 调用方可通过 WithClock 与 ConfigureMonitoring 覆盖。
 func New() *Service {
 	return &Service{
 		st:  store.New(),
+		clk: clock.NewSystemClock(),
 		log: func(string, ...any) {},
 	}
 }
@@ -63,12 +72,27 @@ func (s *Service) WithLogger(f func(format string, args ...any)) *Service {
 // StdLogger 返回标准库 log.Printf 形式的日志函数。
 func StdLogger() func(string, ...any) { return log.Printf }
 
-// RegisterDevice 注册设备。
+// RegisterDevice 注册设备，并把注册时刻作为首次存活接触时间。
 func (s *Service) RegisterDevice(id string, initial model.Version) error {
 	if s.reg == nil {
 		initService(s)
 	}
-	return s.reg.Register(id, initial)
+	if err := s.reg.Register(id, initial); err != nil {
+		return err
+	}
+	now := s.now()
+	s.st.UpdateDevice(id, func(d *model.DeviceState) {
+		d.LastContactAt = now
+	})
+	return nil
+}
+
+// now 返回注入时钟的当前时间；未注入时钟时退回系统时间。
+func (s *Service) now() time.Time {
+	if s.clk == nil {
+		return time.Now()
+	}
+	return s.clk.Now()
 }
 
 // CreateBatch 创建升级批次。
@@ -125,6 +149,8 @@ func (s *Service) Dispatch(batchID, deviceID string) error {
 		d.BatchID = batchID
 		d.TargetVersion = b.TargetVersion
 		d.Phase = model.PhaseAssigned
+		// 在途尝试起点：在途回收等待窗口以此为基准。
+		d.DispatchedAt = s.now()
 		b.Dispatched++
 		s.log("DISPATCH accepted: device=%s batch=%s attempt=%d target=%s quota=%d/%d",
 			d.ID, b.ID, d.AttemptID, b.TargetVersion, b.Dispatched, b.StageQuota())
@@ -150,6 +176,18 @@ func (s *Service) Ingest(ev model.Event) (device.Result, error) {
 		}
 		found = true
 		res = device.ApplyEvent(d, ev)
+		// 只有通过序号闸门的新鲜上报才证明设备此刻真实可达：
+		// 刷新存活接触时间；若此前被巡检判离线，则自动恢复可投放。
+		// 重复/乱序重放既不刷新接触时间，也不改变在线标志。
+		if res.Fresh {
+			wasOffline := !d.Online
+			d.LastContactAt = s.now()
+			d.Online = true
+			if wasOffline {
+				s.log("DEVICE BACK ONLINE device=%s via %s seq=%d, dispatchability restored",
+					d.ID, ev.Type, ev.Seq)
+			}
+		}
 
 		b := batches[d.BatchID]
 		// 只有归属批次存在、且事件被接受时才入账。
@@ -166,9 +204,12 @@ func (s *Service) Ingest(ev model.Event) (device.Result, error) {
 				b.ID, b.Dispatched, b.Succeeded, b.Failed, b.RolledBack, b.FailureRate(), res.Effect)
 			// 熔断优先于阶段推进与完成判定。
 			if batch.MaybeCircuitBreak(b) {
-				s.log("CIRCUIT BREAK batch=%s failureRate=%.2f >= threshold=%.2f, dispatch halted",
+				s.log("CIRCUIT BREAK batch=%s failureRate=%.2f strictly exceeds threshold=%.2f, dispatch halted",
 					b.ID, b.FailureRate(), b.FailureThreshold)
-			} else {
+			}
+			// 已熔断（本拍或此前）的批次：结果正常入账、设备状态继续收敛，
+			// 但不再推进阶段、不再自然完成，也绝不因迟到结果而恢复投放。
+			if b.State != model.BatchCircuitBroken {
 				if batch.AdvanceStage(b) {
 					s.log("STAGE ADVANCE batch=%s -> stage %d quota=%d", b.ID, b.StageIndex, b.StageQuota())
 				}

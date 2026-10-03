@@ -101,13 +101,26 @@ func TestStageQuotaAndAdvance(t *testing.T) {
 }
 
 func TestCircuitBreakAndCompletion(t *testing.T) {
-	b := &model.Batch{
-		ID: "b1", TargetVersion: v(2, 0), State: model.BatchRolling,
+	// 失败率恰好等于阈值（2/4 = 0.5）不得熔断，必须继续投放。
+	equal := &model.Batch{
+		ID: "b0", TargetVersion: v(2, 0), State: model.BatchRolling,
 		Stages: []float64{1}, TotalDevices: 4, FailureThreshold: 0.5,
 		Dispatched: 4, Succeeded: 2, Failed: 2,
 	}
+	if batch.MaybeCircuitBreak(equal) {
+		t.Fatal("failure rate exactly equal to threshold must NOT trip breaker")
+	}
+	if equal.State != model.BatchRolling {
+		t.Fatalf("equal-threshold batch must stay ROLLING, got %s", equal.State)
+	}
+
+	b := &model.Batch{
+		ID: "b1", TargetVersion: v(2, 0), State: model.BatchRolling,
+		Stages: []float64{1}, TotalDevices: 4, FailureThreshold: 0.5,
+		Dispatched: 4, Succeeded: 1, Failed: 3,
+	}
 	if !batch.MaybeCircuitBreak(b) {
-		t.Fatal("failure rate 0.5 must trip breaker at threshold 0.5")
+		t.Fatalf("failure rate %.2f strictly above threshold 0.5 must trip", b.FailureRate())
 	}
 	if b.State != model.BatchCircuitBroken {
 		t.Fatalf("want CIRCUIT_BROKEN, got %s", b.State)
