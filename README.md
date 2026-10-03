@@ -2,7 +2,8 @@
 
 设备机群灰度 OTA 升级编排的本地可复现模拟实现：用模拟设备与有损传输链路
 替代真实链路，覆盖**分阶段投放、生命周期幂等控制、重复/乱序/离线重连上报
-收敛、失败自动回滚与失败率熔断**，全部结论在并发下一致且可解释。
+收敛、失败自动回滚与失败率熔断、设备存活巡检与卡批自愈**，全部结论在并发下
+一致且可解释。
 
 完整设计（状态机图、批次/回滚规则、并发模型）见 [`docs/design.md`](docs/design.md)。
 
@@ -16,7 +17,15 @@
   /重复结果不重复计数，迟到/乱序上报不倒退状态，重连后旧尝试上报被丢弃。
 - **失败回滚**：失败设备进入回滚并钉在 `LastGoodVersion`，版本漂移的回滚
   上报被拒绝；回滚完成后设备回到可运行、可再次升级的 `FAILED` 终态。
-- **熔断**：整批失败率达到阈值立即熔断并停止后续投放（判定与计数同一临界区）。
+- **熔断（严格口径）**：整批失败率**严格超过**阈值才熔断并停止后续投放；
+  失败率恰好等于阈值时照常投放。熔断只关闭新投放，在途设备的迟到结果仍
+  正常入账、收敛并完成回滚。
+- **存活巡检**：编排侧按可配置心跳超时窗口独立判定设备离线（不依赖传输层
+  丢包），离线设备一律不派发；设备重新上报心跳/重连后自动恢复可投放。
+  时钟可注入，测试用假时钟确定性推进，不靠真实 sleep。
+- **卡批自愈**：已派发但失联且超过在途等待窗口仍无结果的尝试被自动回收，
+  释放阶段名额继续投放其他在线设备；回收幂等可重复触发。被回收设备重连后
+  获得全新尝试，旧尝试的迟到上报不计数、不改状态、不改版本。
 - **可复现模拟**：固定随机种子的链路，可配置丢包率、重复率、乱序与离线。
 
 ## 目录
@@ -45,6 +54,9 @@ go test ./internal/device/ -v
 go test ./internal/rollout/ -v
 go test ./internal/sim/ -v
 
+# 只复现存活巡检 / 卡批自愈 / 熔断口径场景（假时钟推进，无真实 sleep）
+go test ./internal/rollout/ -run 'Liveness|Reclaim|Circuit' -v
+
 # 2) 端到端演示：三阶段投放、暂停拒绝派发、4 台设备失败触发 40% 熔断、
 #    失败设备自动回滚到 1.0，最后终止批次（重复终止幂等）
 go run ./cmd/demo
@@ -58,7 +70,11 @@ go run ./cmd/demo
 | 乱序/迟到上报不倒退 | `device.TestOutOfOrderReportDropped`、`sim.TestOutOfOrderBatchDelivered` |
 | 离线后重连收敛 | `rollout.TestOfflineReconnectConvergence`、`sim.TestOfflineReconnectSimulated` |
 | 部分失败 + 自动回滚 | `device.TestFailureRollbackAndVersionDrift` |
-| 熔断触发并停止投放 | `rollout.TestCircuitBreakStopsRollout`、`sim.TestPartialFailureTriggersCircuitBreak` |
+| 熔断严格超过阈值才触发 | `rollout.TestCircuitBreakStopsRollout`、`batch.TestCircuitBreakAndCompletion`、`sim.TestPartialFailureTriggersCircuitBreak` |
+| 熔断后迟到结果仍收敛回滚 | `rollout.TestCircuitBrokenBatchStillConvergesLateResults` |
+| 存活巡检判离线/恢复 | `rollout.TestLivenessSweepMarksOffline`、`rollout.TestHeartbeatRestoresDispatchability` |
+| 卡批回收释放阶段名额 | `rollout.TestReclaimFreesStuckStageQuota` |
+| 回收后旧尝试迟到上报丢弃 | `rollout.TestReclaimedDeviceFreshAttemptAndLateReportDropped` |
 | 暂停/恢复/终止幂等 | `rollout.TestLifecycleIdempotentAndTerminal`、`batch.TestLifecycleTransitions` |
 | 阶段闸门与推进 | `rollout.TestStagedRolloutGate`、`batch.TestStageQuotaAndAdvance` |
 | 归属唯一/改派 | `rollout.TestFailedDeviceRedispatchToNewBatch`、`TestDuplicateDispatchIdempotent` |

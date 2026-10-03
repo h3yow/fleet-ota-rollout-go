@@ -202,7 +202,8 @@ func MaybeComplete(b *model.Batch) bool {
 	return false
 }
 
-// MaybeCircuitBreak 熔断判定（纯函数）：已有结果且失败率达到/超过阈值。
+// MaybeCircuitBreak 熔断判定（纯函数）：已有结果且失败率**严格超过**阈值。
+// 失败率恰好等于阈值时不熔断，继续正常投放。
 // 仅在 ROLLING/PAUSED 下可触发，返回是否发生熔断。
 func MaybeCircuitBreak(b *model.Batch) bool {
 	if b.State != model.BatchRolling && b.State != model.BatchPaused {
@@ -211,7 +212,7 @@ func MaybeCircuitBreak(b *model.Batch) bool {
 	if b.Decided() == 0 {
 		return false
 	}
-	if b.FailureRate() >= b.FailureThreshold {
+	if b.FailureRate() > b.FailureThreshold {
 		b.State = model.BatchCircuitBroken
 		return true
 	}

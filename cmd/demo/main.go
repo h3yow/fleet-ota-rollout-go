@@ -50,7 +50,7 @@ func main() {
 			ev.DeviceID, ev.Seq, ev.Type, res.Accepted, res.OldPhase, res.NewPhase, res.Reason)
 	}
 
-	// 4 台设备会刷写失败，升级过程中失败率将达到 40% 阈值触发熔断。
+	// 4 台设备会刷写失败，升级过程中失败率将严格超过 40% 阈值触发熔断。
 	for _, id := range []string{"dev-03", "dev-05", "dev-07", "dev-09"} {
 		agents[id].SetFail(1, true)
 	}

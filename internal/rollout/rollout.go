@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/h3yow/fleet-ota-rollout-go/internal/batch"
 	"github.com/h3yow/fleet-ota-rollout-go/internal/device"
@@ -35,13 +36,29 @@ type Service struct {
 	bm  *batch.Manager
 	reg *device.Registry
 	log func(format string, args ...any)
+
+	// now 为编排侧时钟，可注入假时钟以便测试确定性推进时间。
+	now func() time.Time
+	// heartbeatTimeout 心跳超时窗口：超过该窗口没有任何上报即判离线。
+	heartbeatTimeout time.Duration
+	// inFlightTimeout 在途等待窗口：派发后失联且超过该窗口无结果即回收名额。
+	inFlightTimeout time.Duration
 }
+
+// 默认巡检参数。
+const (
+	defaultHeartbeatTimeout = 30 * time.Second
+	defaultInFlightTimeout  = 90 * time.Second
+)
 
 // New 创建编排服务。
 func New() *Service {
 	return &Service{
-		st:  store.New(),
-		log: func(string, ...any) {},
+		st:               store.New(),
+		log:              func(string, ...any) {},
+		now:              time.Now,
+		heartbeatTimeout: defaultHeartbeatTimeout,
+		inFlightTimeout:  defaultInFlightTimeout,
 	}
 }
 
@@ -63,12 +80,41 @@ func (s *Service) WithLogger(f func(format string, args ...any)) *Service {
 // StdLogger 返回标准库 log.Printf 形式的日志函数。
 func StdLogger() func(string, ...any) { return log.Printf }
 
+// WithClock 注入编排侧时钟（测试可注入假时钟确定性推进时间）。
+func (s *Service) WithClock(now func() time.Time) *Service {
+	if now != nil {
+		s.now = now
+	}
+	return s
+}
+
+// WithHeartbeatTimeout 配置心跳超时窗口（存活巡检判定离线的依据）。
+func (s *Service) WithHeartbeatTimeout(d time.Duration) *Service {
+	if d > 0 {
+		s.heartbeatTimeout = d
+	}
+	return s
+}
+
+// WithInFlightTimeout 配置在途等待窗口（卡批自愈回收名额的依据）。
+func (s *Service) WithInFlightTimeout(d time.Duration) *Service {
+	if d > 0 {
+		s.inFlightTimeout = d
+	}
+	return s
+}
+
 // RegisterDevice 注册设备。
 func (s *Service) RegisterDevice(id string, initial model.Version) error {
 	if s.reg == nil {
 		initService(s)
 	}
-	return s.reg.Register(id, initial)
+	if err := s.reg.Register(id, initial); err != nil {
+		return err
+	}
+	now := s.now()
+	s.st.UpdateDevice(id, func(d *model.DeviceState) { d.LastSeenAt = now })
+	return nil
 }
 
 // CreateBatch 创建升级批次。
@@ -125,6 +171,7 @@ func (s *Service) Dispatch(batchID, deviceID string) error {
 		d.BatchID = batchID
 		d.TargetVersion = b.TargetVersion
 		d.Phase = model.PhaseAssigned
+		d.AssignedAt = s.now()
 		b.Dispatched++
 		s.log("DISPATCH accepted: device=%s batch=%s attempt=%d target=%s quota=%d/%d",
 			d.ID, b.ID, d.AttemptID, b.TargetVersion, b.Dispatched, b.StageQuota())
@@ -149,6 +196,8 @@ func (s *Service) Ingest(ev model.Event) (device.Result, error) {
 			return
 		}
 		found = true
+		// 任何上报都是存活信号：刷新编排侧 LastSeenAt（存活巡检的依据）。
+		d.LastSeenAt = s.now()
 		res = device.ApplyEvent(d, ev)
 
 		b := batches[d.BatchID]
@@ -166,7 +215,7 @@ func (s *Service) Ingest(ev model.Event) (device.Result, error) {
 				b.ID, b.Dispatched, b.Succeeded, b.Failed, b.RolledBack, b.FailureRate(), res.Effect)
 			// 熔断优先于阶段推进与完成判定。
 			if batch.MaybeCircuitBreak(b) {
-				s.log("CIRCUIT BREAK batch=%s failureRate=%.2f >= threshold=%.2f, dispatch halted",
+				s.log("CIRCUIT BREAK batch=%s failureRate=%.2f > threshold=%.2f, dispatch halted",
 					b.ID, b.FailureRate(), b.FailureThreshold)
 			} else {
 				if batch.AdvanceStage(b) {

@@ -63,7 +63,7 @@ PENDING ──Start──▶ ROLLING ◀──Resume── PAUSED
                     │  ▲                    │
                     └──┴──── Pause ─────────┘
                     │
-       失败率≥阈值  ▼                    全部设备出结果
+       失败率>阈值  ▼                    全部设备出结果
               CIRCUIT_BROKEN          ┌────────▶ COMPLETED
                     │                 │
        Terminate（任意非 COMPLETED 状态均可，幂等）
@@ -87,6 +87,8 @@ PENDING ──Start──▶ ROLLING ◀──Resume── PAUSED
 - 设备已归属批次 A 时，只有 A 到达终态（`TERMINATED`/`COMPLETED`，
   熔断需先终止）后才允许改派到批次 B。
 - 同一设备重复派发到同一批次为幂等成功，不重复自增 `Dispatched`。
+- 卡批自愈的回收（见第 6 节）也在同一临界区内解除归属并释放名额，
+  回收后设备重新派发时归属依旧唯一。
 - 因此任意操作顺序下，每台设备最终归属的批次与目标版本唯一确定。
 
 ## 5. 失败判定、自动回滚与熔断
@@ -95,15 +97,45 @@ PENDING ──Start──▶ ROLLING ◀──Resume── PAUSED
   批次 `Failed`），随后 `ROLLBACK_DONE` 校验版本后进入 `FAILED`（计入
   `RolledBack`）。
 - 批次失败率 = `Failed / (Succeeded + Failed)`。在失败计数入账的**同一临界区**
-  内比较阈值：`failureRate >= FailureThreshold` 立即把批次置为
-  `CIRCUIT_BROKEN`，此后任何派发都被闸门拒绝。
+  内比较阈值：`failureRate > FailureThreshold`（**严格超过**）才把批次置为
+  `CIRCUIT_BROKEN`，此后任何派发都被闸门拒绝。**失败率恰好等于阈值时不熔断**，
+  后续投放照常进行。
 - 熔断优先于阶段推进与批次完成判定：已熔断的批次不会因迟到结果而“自动恢复”
-  或“完成”。迟到结果仍会正常入账（设备状态继续收敛到成功/失败终态），但不
-  再放行新的派发。
+  或“完成”。**熔断只关闭新投放，不关闭结果收敛**：熔断前已在途的设备，其迟到
+  结果仍正常入账（计入 Succeeded/Failed/RolledBack），设备状态机继续收敛到
+  成功/失败终态，回滚照常完成，不会把设备卡在半更新状态。
 - 熔断后的批次可通过 `Terminate` 进入终态；`FAILED` 设备随后可被新批次
   重新升级（AttemptID 递增，旧上报无法污染新尝试）。
 
-## 6. 并发一致性
+## 6. 设备存活巡检与卡批自愈
+
+编排侧不依赖传输层是否丢包来判断设备死活，而是独立维护一份“存活账本”：
+
+- **存活账本**：`DeviceState.LastSeenAt` 记录编排侧**时钟**下最近一次收到该
+  设备任何上报（心跳、重连、结果类事件均可）的时刻；`AssignedAt` 记录当前
+  在途尝试的派发时刻。时钟通过 `WithClock` 注入，测试用假时钟在确定时间点
+  推进，不依赖真实 sleep。
+- **存活巡检（`Tick` 第一步）**：`now - LastSeenAt > heartbeatTimeout`
+  （`WithHeartbeatTimeout` 配置）即判定设备离线（`Online=false`）。离线设备
+  在 `Dispatch` 闸门处一律被拒绝，任何情况下都不会被派发。设备重新上报心跳
+  或重连事件后自动恢复在线、恢复可投放，无需人工干预。
+- **卡批自愈（`Tick` 第二步）**：已派发（`ASSIGNED`/`UPDATING`，即尚无结果）
+  但已失联、且 `now - AssignedAt > inFlightTimeout`（`WithInFlightTimeout`
+  配置）的在途记录被回收：
+  - 设备回到 `IDLE`、解除批次归属（`BatchID` 清空）、`AssignedAt` 清零；
+  - 批次 `Dispatched` 同步减一，当前阶段名额被释放，可继续投给其他在线设备；
+  - 回收在同一存储临界区内完成，且设备被回收后即不在“在途且失联”集合内，
+    因此 `Tick` 可任意重复触发，不会重复回收或重复扣减计数。
+- **回收后的兼容口径**：被回收设备重连后可被重新派发，获得**全新 AttemptID**
+  的升级尝试，归属批次与目标版本仍然唯一。旧尝试的迟到上报因
+  `BatchID`/`AttemptID` 与当前归属不匹配，被设备状态机一律丢弃：**不计入
+  成功/失败/回滚任何计数、不改动设备状态、不把版本改回去**。
+- 已有结果的在途尝试（如 `ROLLBACK` 中失联）**不回收**：其结果已入账，继续
+  等待迟到上报收敛，避免计数错乱。
+- 生产环境中 `Tick` 由调用方按固定周期触发（本仓库的测试与 demo 均为显式
+  调用，保证可复现）。
+
+## 7. 并发一致性
 
 - `Store` 全库使用同一把锁。`Dispatch` 与 `Ingest` 的“读取判定 + 状态写入 +
   批次计数”都在同一个临界区内完成，不存在“判定后被别的 goroutine 改写”的
@@ -111,7 +143,7 @@ PENDING ──Start──▶ ROLLING ◀──Resume── PAUSED
 - 状态快照以值拷贝返回，调用方读到的是一致瞬间。
 - 所有测试均在 `-race` 下通过。
 
-## 7. 本地可复现模拟
+## 8. 本地可复现模拟
 
 - `sim.Link(seed, dropRate, dupRate)`：固定种子的确定性随机，支持丢包、
   重复投递、批量乱序洗牌，以及设备离线（`SetOffline`，离线期间事件全丢）。

@@ -130,14 +130,14 @@ func TestDuplicateDispatchIdempotent(t *testing.T) {
 
 func TestCircuitBreakStopsRollout(t *testing.T) {
 	svc := newService(t, 4)
-	// 阈值 0.5：1 成功 1 失败即达 0.5 触发熔断。
+	// 阈值 0.5：1 成功 1 失败时失败率恰为 0.5，不得熔断；
+	// 再失败一台后 2/3 ≈ 0.67 严格超过阈值，必须熔断。
 	if err := svc.CreateBatch("b1", v2, []float64{1}, 4, 0.5); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.StartBatch("b1"); err != nil {
 		t.Fatal(err)
 	}
-	// 初始只派发两台，熔断后第三台必须无法派发。
 	for _, dev := range []string{"dev-0", "dev-1"} {
 		if err := svc.Dispatch("b1", dev); err != nil {
 			t.Fatalf("dispatch %s: %v", dev, err)
@@ -154,16 +154,33 @@ func TestCircuitBreakStopsRollout(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, b := svc.Snapshot("dev-0", "b1")
-	t.Logf("batch after failure: state=%s failed=%d succeeded=%d rolledBack=%d failureRate=%.2f",
+	t.Logf("batch at exact threshold: state=%s failed=%d succeeded=%d failureRate=%.2f",
+		b.State, b.Failed, b.Succeeded, b.FailureRate())
+	// 失败率恰好等于阈值：不熔断，后续设备必须还能正常派发。
+	if b.State != model.BatchRolling {
+		t.Fatalf("rate == threshold must not break, got %s", b.State)
+	}
+	if err := svc.Dispatch("b1", "dev-2"); err != nil {
+		t.Fatalf("dispatch at exact threshold must be allowed: %v", err)
+	}
+	// dev-2 失败：失败率 2/3 严格超过阈值，熔断。
+	if _, err := svc.Ingest(model.Event{DeviceID: "dev-2", Seq: 1, Type: model.EventUpdateFailed, BatchID: "b1", AttemptID: 1, Reason: "flash error"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Ingest(model.Event{DeviceID: "dev-2", Seq: 2, Type: model.EventRollbackDone, Version: v1, BatchID: "b1", AttemptID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	_, b = svc.Snapshot("dev-0", "b1")
+	t.Logf("batch after exceeding threshold: state=%s failed=%d succeeded=%d rolledBack=%d failureRate=%.2f",
 		b.State, b.Failed, b.Succeeded, b.RolledBack, b.FailureRate())
 	if b.State != model.BatchCircuitBroken {
 		t.Fatalf("batch must be circuit broken, got %s", b.State)
 	}
-	if b.Failed != 1 || b.RolledBack != 1 {
+	if b.Failed != 2 || b.RolledBack != 2 {
 		t.Fatalf("bad counters: %+v", b)
 	}
 	// 熔断后后续设备不得再被派发。
-	if err := svc.Dispatch("b1", "dev-2"); err == nil {
+	if err := svc.Dispatch("b1", "dev-3"); err == nil {
 		t.Fatal("circuit-broken batch must not dispatch")
 	}
 	// 暂停/恢复都不能解除熔断。

@@ -95,8 +95,12 @@ type DeviceState struct {
 	AttemptID uint64
 	// LastSeq 已处理的最大事件序号，用于丢弃迟到/乱序上报。
 	LastSeq uint64
-	// Online 设备是否在线（由心跳/重连维护）。
+	// Online 设备是否在线（由心跳/重连维护，或由编排侧存活巡检判定离线）。
 	Online bool
+	// LastSeenAt 编排侧最近一次收到该设备任何上报的时刻（编排侧时钟）。
+	LastSeenAt time.Time
+	// AssignedAt 当前在途尝试的派发时刻（编排侧时钟）；无在途尝试时为零值。
+	AssignedAt time.Time
 }
 
 // CanDispatch 设备当前是否可被派发：处于空闲/失败终态。
