@@ -142,6 +142,12 @@ func (s *Service) Dispatch(batchID, deviceID string) error {
 			outErr = store.ErrNotFound
 			return
 		}
+		// 离线设备在任何情况下都不可派发——即使是同一批次的重复派发，
+		// 也要先拒绝，避免离线设备被当成仍可投放。
+		if !d.Online {
+			outErr = fmt.Errorf("%w: %s", ErrDeviceOffline, d.ID)
+			return
+		}
 		// 幂等：已归属同一批次。
 		if d.BatchID == batchID {
 			idempotent = true
@@ -149,10 +155,6 @@ func (s *Service) Dispatch(batchID, deviceID string) error {
 		}
 		if err := batch.GateDispatch(b); err != nil {
 			outErr = err
-			return
-		}
-		if !d.Online {
-			outErr = fmt.Errorf("%w: %s", ErrDeviceOffline, d.ID)
 			return
 		}
 		if d.Phase.InProgress() {
@@ -196,9 +198,14 @@ func (s *Service) Ingest(ev model.Event) (device.Result, error) {
 			return
 		}
 		found = true
-		// 任何上报都是存活信号：刷新编排侧 LastSeenAt（存活巡检的依据）。
-		d.LastSeenAt = s.now()
 		res = device.ApplyEvent(d, ev)
+		// 存活判定只认真正新鲜、按顺序到达且被状态机接受的上报：
+		// 重复、乱序、过期尝试的重放一律不刷新存活时间，
+		// 也不会把已判离线的设备重新变回在线。
+		if res.Accepted {
+			d.LastSeenAt = s.now()
+			d.Online = true
+		}
 
 		b := batches[d.BatchID]
 		// 只有归属批次存在、且事件被接受时才入账。

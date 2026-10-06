@@ -325,3 +325,181 @@ func TestCircuitBrokenBatchStillConvergesLateResults(t *testing.T) {
 		t.Fatalf("circuit-broken batch must stay broken, got %s", b2.State)
 	}
 }
+
+// TestStaleReplayNeverRefreshesLiveness：设备彻底静默、超过存活窗口后，
+// 链路上偶尔重放的重复/乱序/过期旧消息一律不算存活信号：
+// 既不刷新存活时间，也不把已判离线的设备重新变回在线；
+// 其占用的在途名额照常超时回收，释放给其他在线设备。
+func TestStaleReplayNeverRefreshesLiveness(t *testing.T) {
+	clk := newFakeClock()
+	svc := newClockedService(t, clk, 2)
+	if err := svc.CreateBatch("b1", v2, []float64{0.5, 1.0}, 2, 0.9); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.StartBatch("b1"); err != nil {
+		t.Fatal(err)
+	}
+	// t0：dev-0 一次新鲜心跳后被派发（attempt 1），随后彻底失联。
+	if _, err := svc.Ingest(heartbeat("dev-0", 1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Dispatch("b1", "dev-0"); err != nil {
+		t.Fatal(err)
+	}
+	d0, _ := svc.Snapshot("dev-0", "b1")
+	lastSeen := d0.LastSeenAt
+
+	// 静默期间链路每隔几秒重放一条旧消息：重复心跳、过期尝试的结果、
+	// 乱序心跳。相邻重放间隔都小于存活窗口——只要其中任何一条被误当成
+	// 存活信号，设备就永远不会被判离线、名额也永远收不回来。
+	replays := []struct {
+		advance time.Duration
+		ev      model.Event
+	}{
+		{6 * time.Second, heartbeat("dev-0", 1)}, // 重复：同 Seq 心跳
+		{4 * time.Second, model.Event{DeviceID: "dev-0", Seq: 5, Type: model.EventUpdateSucceeded, Version: v2, BatchID: "b1", AttemptID: 42}}, // 过期尝试的结果
+		{4 * time.Second, heartbeat("dev-0", 2)}, // 乱序：Seq 2 < LastSeq 5
+		{4 * time.Second, model.Event{DeviceID: "dev-0", Seq: 5, Type: model.EventUpdateSucceeded, Version: v2, BatchID: "b1", AttemptID: 42}}, // 重复的过期结果
+		{4 * time.Second, heartbeat("dev-0", 3)}, // 乱序心跳
+	}
+	for i, r := range replays {
+		clk.Advance(r.advance)
+		t.Logf("input: stale replay #%d seq=%d type=%s attempt=%d", i, r.ev.Seq, r.ev.Type, r.ev.AttemptID)
+		res, err := svc.Ingest(r.ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Accepted {
+			t.Fatalf("stale replay #%d must be dropped: %+v", i, res)
+		}
+		d, _ := svc.Snapshot("dev-0", "b1")
+		if !d.LastSeenAt.Equal(lastSeen) {
+			t.Fatalf("stale replay #%d must not refresh liveness: lastSeen=%s want %s",
+				i, d.LastSeenAt, lastSeen)
+		}
+	}
+
+	// 最后一次有效上报至今已 22s（> 10s 存活窗口）：判离线、不可派发；
+	// 在途 22s 尚未超过 30s 等待窗口，先不回收。
+	offline, reclaimed := svc.Tick()
+	t.Logf("judge: tick markedOffline=%d reclaimed=%d", offline, reclaimed)
+	if reclaimed != 0 {
+		t.Fatalf("in-flight 22s <= %s, must not reclaim yet, got %d", testInFlightTimeout, reclaimed)
+	}
+	d0, _ = svc.Snapshot("dev-0", "b1")
+	if d0.Online {
+		t.Fatal("device silent beyond heartbeat window must be offline despite stale replays")
+	}
+	if err := svc.Dispatch("b1", "dev-0"); err == nil {
+		t.Fatal("offline device must never be dispatched")
+	} else {
+		t.Logf("judge: dispatch dev-0 rejected as expected: %v", err)
+	}
+
+	// 判离线后再来一条过期重放：绝不能把设备重新变回在线。
+	clk.Advance(4 * time.Second)
+	t.Log("input: stale replay after offline judgment")
+	if _, err := svc.Ingest(heartbeat("dev-0", 1)); err != nil {
+		t.Fatal(err)
+	}
+	d0, _ = svc.Snapshot("dev-0", "b1")
+	if d0.Online {
+		t.Fatal("stale replay must not bring an offline device back online")
+	}
+	if !d0.LastSeenAt.Equal(lastSeen) {
+		t.Fatalf("stale replay must not refresh liveness: lastSeen=%s want %s", d0.LastSeenAt, lastSeen)
+	}
+
+	// dev-1 重新上报新鲜心跳保持在线。
+	t.Log("input: dev-1 fresh heartbeat")
+	if _, err := svc.Ingest(heartbeat("dev-1", 1)); err != nil {
+		t.Fatal(err)
+	}
+
+	// 在途时长严格超过等待窗口：dev-0 的在途记录被回收，名额释放。
+	clk.Advance(5 * time.Second) // dev-0 在途 31s > 30s
+	_, reclaimed = svc.Tick()
+	t.Logf("judge: tick reclaimed=%d", reclaimed)
+	if reclaimed != 1 {
+		t.Fatalf("stuck attempt must be reclaimed, got %d", reclaimed)
+	}
+	d0, b := svc.Snapshot("dev-0", "b1")
+	if d0.Phase != model.PhaseIdle || d0.BatchID != "" {
+		t.Fatalf("reclaimed device must return to IDLE without ownership: %+v", d0)
+	}
+	if b.Dispatched != 0 {
+		t.Fatalf("reclaim must release quota: dispatched=%d want 0", b.Dispatched)
+	}
+	// 被占住的名额释放后，在线的 dev-1 可以投出；离线的 dev-0 仍不可派发。
+	if err := svc.Dispatch("b1", "dev-1"); err != nil {
+		t.Fatalf("freed quota must be dispatchable to online device: %v", err)
+	}
+	if err := svc.Dispatch("b1", "dev-0"); err == nil {
+		t.Fatal("offline device must stay non-dispatchable after reclaim")
+	}
+}
+
+// TestWindowBoundaryExactVsExceeded：存活窗口与在途等待窗口都按
+// “严格超过才触发”判定：恰好等于窗口时既不判离线也不回收。
+func TestWindowBoundaryExactVsExceeded(t *testing.T) {
+	clk := newFakeClock()
+	svc := newClockedService(t, clk, 1)
+	if err := svc.CreateBatch("b1", v2, []float64{1}, 1, 0.9); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.StartBatch("b1"); err != nil {
+		t.Fatal(err)
+	}
+	// t0：派发 dev-0（attempt 1），随后设备彻底失联。
+	if err := svc.Dispatch("b1", "dev-0"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 恰好沉默一个存活窗口（10s）：不判离线。
+	t.Logf("input: advance clock by exactly %s (== heartbeat window)", testHeartbeatTimeout)
+	clk.Advance(testHeartbeatTimeout)
+	offline, reclaimed := svc.Tick()
+	t.Logf("judge: tick markedOffline=%d reclaimed=%d", offline, reclaimed)
+	if offline != 0 || reclaimed != 0 {
+		t.Fatalf("silence == window must not trigger: offline=%d reclaimed=%d", offline, reclaimed)
+	}
+	if d, _ := svc.Snapshot("dev-0", "b1"); !d.Online {
+		t.Fatal("device must stay online when silence exactly equals the window")
+	}
+
+	// 严格超过存活窗口 1s：判离线；但在途 11s < 30s，不回收。
+	clk.Advance(1 * time.Second)
+	offline, reclaimed = svc.Tick()
+	t.Logf("judge: tick markedOffline=%d reclaimed=%d", offline, reclaimed)
+	if offline != 1 {
+		t.Fatalf("silence > window must mark offline, got %d", offline)
+	}
+	if reclaimed != 0 {
+		t.Fatalf("in-flight 11s <= %s, must not reclaim, got %d", testInFlightTimeout, reclaimed)
+	}
+
+	// 推进到在途时长恰好等于等待窗口（30s）：仍不回收。
+	t.Logf("input: advance clock so in-flight == %s (== in-flight window)", testInFlightTimeout)
+	clk.Advance(testInFlightTimeout - 11*time.Second)
+	_, reclaimed = svc.Tick()
+	t.Logf("judge: tick reclaimed=%d", reclaimed)
+	if reclaimed != 0 {
+		t.Fatalf("in-flight == window must not reclaim, got %d", reclaimed)
+	}
+	d, b := svc.Snapshot("dev-0", "b1")
+	if d.Phase != model.PhaseAssigned || d.BatchID != "b1" || b.Dispatched != 1 {
+		t.Fatalf("attempt must stay in-flight at exact window: dev=%+v dispatched=%d", d, b.Dispatched)
+	}
+
+	// 严格超过等待窗口 1s：回收在途记录，名额释放。
+	clk.Advance(1 * time.Second)
+	_, reclaimed = svc.Tick()
+	t.Logf("judge: tick reclaimed=%d", reclaimed)
+	if reclaimed != 1 {
+		t.Fatalf("in-flight > window must reclaim, got %d", reclaimed)
+	}
+	d, b = svc.Snapshot("dev-0", "b1")
+	if d.Phase != model.PhaseIdle || d.BatchID != "" || b.Dispatched != 0 {
+		t.Fatalf("reclaim must free the attempt: dev=%+v dispatched=%d", d, b.Dispatched)
+	}
+}

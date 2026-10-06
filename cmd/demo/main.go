@@ -50,8 +50,10 @@ func main() {
 			ev.DeviceID, ev.Seq, ev.Type, res.Accepted, res.OldPhase, res.NewPhase, res.Reason)
 	}
 
-	// 4 台设备会刷写失败，升级过程中失败率将严格超过 40% 阈值触发熔断。
-	for _, id := range []string{"dev-03", "dev-05", "dev-07", "dev-09"} {
+	// 第 2 阶段投出的 3 台设备（dev-02/03/04）全部刷写失败：
+	// 无论结果到达顺序如何，第 2 个失败入账时失败率即为 2/4=50%，
+	// 严格超过 40% 阈值，保证每次运行都稳定熔断、停止后续投放。
+	for _, id := range []string{"dev-02", "dev-03", "dev-04"} {
 		agents[id].SetFail(1, true)
 	}
 
@@ -93,7 +95,7 @@ func main() {
 		log.Printf("--- 阶段 %d 结算: state=%s dispatched=%d ok=%d failed=%d rolledBack=%d rate=%.0f%% ---",
 			stage, b.State, b.Dispatched, b.Succeeded, b.Failed, b.RolledBack, b.FailureRate()*100)
 		if b.State == model.BatchCircuitBroken {
-			log.Printf("=== 熔断：失败率 %.0f%% 达到阈值 %.0f%%，停止后续投放 ===",
+			log.Printf("=== 熔断：失败率 %.0f%% 严格超过阈值 %.0f%%，停止后续投放 ===",
 				b.FailureRate()*100, b.FailureThreshold*100)
 			break
 		}

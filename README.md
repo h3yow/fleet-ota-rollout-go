@@ -21,11 +21,15 @@
   失败率恰好等于阈值时照常投放。熔断只关闭新投放，在途设备的迟到结果仍
   正常入账、收敛并完成回滚。
 - **存活巡检**：编排侧按可配置心跳超时窗口独立判定设备离线（不依赖传输层
-  丢包），离线设备一律不派发；设备重新上报心跳/重连后自动恢复可投放。
-  时钟可注入，测试用假时钟确定性推进，不靠真实 sleep。
-- **卡批自愈**：已派发但失联且超过在途等待窗口仍无结果的尝试被自动回收，
-  释放阶段名额继续投放其他在线设备；回收幂等可重复触发。被回收设备重连后
-  获得全新尝试，旧尝试的迟到上报不计数、不改状态、不改版本。
+  丢包）。**存活判定只认真正新鲜、按顺序到达且被状态机接受的上报**；链路上
+  重放的重复、乱序、过期消息既不刷新存活时间，也不会把已判离线的设备重新
+  变回在线。沉默时长**严格超过**窗口才判离线（恰好等于不判）；离线设备一律
+  不派发，重新上报新鲜心跳/重连后自动恢复可投放。时钟可注入，测试用假时钟
+  确定性推进，不靠真实 sleep。
+- **卡批自愈**：已派发但失联且**严格超过**在途等待窗口仍无结果的尝试被自动
+  回收（恰好等于窗口不回收），释放阶段名额继续投放其他在线设备；回收幂等
+  可重复触发。被回收设备重连后获得全新尝试，旧尝试的迟到上报不计数、不改
+  状态、不改版本。
 - **可复现模拟**：固定随机种子的链路，可配置丢包率、重复率、乱序与离线。
 
 ## 目录
@@ -55,9 +59,10 @@ go test ./internal/rollout/ -v
 go test ./internal/sim/ -v
 
 # 只复现存活巡检 / 卡批自愈 / 熔断口径场景（假时钟推进，无真实 sleep）
-go test ./internal/rollout/ -run 'Liveness|Reclaim|Circuit' -v
+go test ./internal/rollout/ -run 'Liveness|Reclaim|Circuit|WindowBoundary' -v
 
-# 2) 端到端演示：三阶段投放、暂停拒绝派发、4 台设备失败触发 40% 熔断、
+# 2) 端到端演示：三阶段投放、暂停拒绝派发、第 2 阶段 3 台设备全部失败，
+#    失败率 60% 严格超过 40% 阈值，每次运行都稳定熔断并停止后续投放，
 #    失败设备自动回滚到 1.0，最后终止批次（重复终止幂等）
 go run ./cmd/demo
 ```
@@ -73,6 +78,8 @@ go run ./cmd/demo
 | 熔断严格超过阈值才触发 | `rollout.TestCircuitBreakStopsRollout`、`batch.TestCircuitBreakAndCompletion`、`sim.TestPartialFailureTriggersCircuitBreak` |
 | 熔断后迟到结果仍收敛回滚 | `rollout.TestCircuitBrokenBatchStillConvergesLateResults` |
 | 存活巡检判离线/恢复 | `rollout.TestLivenessSweepMarksOffline`、`rollout.TestHeartbeatRestoresDispatchability` |
+| 重放旧消息不算存活、名额可回收 | `rollout.TestStaleReplayNeverRefreshesLiveness` |
+| 窗口恰好等于不触发、严格超过才触发 | `rollout.TestWindowBoundaryExactVsExceeded` |
 | 卡批回收释放阶段名额 | `rollout.TestReclaimFreesStuckStageQuota` |
 | 回收后旧尝试迟到上报丢弃 | `rollout.TestReclaimedDeviceFreshAttemptAndLateReportDropped` |
 | 暂停/恢复/终止幂等 | `rollout.TestLifecycleIdempotentAndTerminal`、`batch.TestLifecycleTransitions` |

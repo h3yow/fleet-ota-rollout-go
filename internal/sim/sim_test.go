@@ -115,7 +115,7 @@ func TestOfflineReconnectSimulated(t *testing.T) {
 }
 
 // TestPartialFailureTriggersCircuitBreak：多设备并发、部分设备失败，
-// 失败率达到阈值后熔断，计数收敛。
+// 失败率严格超过阈值后熔断，计数收敛。
 func TestPartialFailureTriggersCircuitBreak(t *testing.T) {
 	svc := rollout.New().WithLogger(func(f string, a ...any) { t.Logf("judge: "+f, a...) })
 	const n = 6
@@ -126,7 +126,7 @@ func TestPartialFailureTriggersCircuitBreak(t *testing.T) {
 		_ = svc.RegisterDevice(id, model.Version{Major: 1})
 		agents[i] = sim.NewAgent(id, model.Version{Major: 1}, link)
 	}
-	// 阈值 0.6：3 成 3 败（0.5 尚未触发）→ 第 4 台失败达 0.25? 构造为 2 成 3 败 = 0.6。
+	// 阈值 0.6：2 成 4 败，最终失败率 4/6≈0.67 严格超过阈值，必然熔断。
 	_ = svc.CreateBatch("b1", model.Version{Major: 2}, []float64{1}, n, 0.6)
 	_ = svc.StartBatch("b1")
 	for i, a := range agents {
@@ -135,7 +135,8 @@ func TestPartialFailureTriggersCircuitBreak(t *testing.T) {
 		}
 		dd, _ := svc.Snapshot(a.ID(), "b1")
 		a.Assign("b1", model.Version{Major: 2}, dd.AttemptID)
-		// 前两台成功，后四台失败；第 5 台结果入账时失败率 3/5=0.6 触发熔断。
+		// 前两台成功，后四台失败；无论结果到达顺序如何，最迟在第 4 台失败
+		// 入账时失败率 4/6≈0.67 严格超过 0.6 触发熔断。
 		if i >= 2 {
 			a.SetFail(dd.AttemptID, true)
 		}

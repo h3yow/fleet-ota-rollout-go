@@ -112,16 +112,21 @@ PENDING ──Start──▶ ROLLING ◀──Resume── PAUSED
 编排侧不依赖传输层是否丢包来判断设备死活，而是独立维护一份“存活账本”：
 
 - **存活账本**：`DeviceState.LastSeenAt` 记录编排侧**时钟**下最近一次收到该
-  设备任何上报（心跳、重连、结果类事件均可）的时刻；`AssignedAt` 记录当前
-  在途尝试的派发时刻。时钟通过 `WithClock` 注入，测试用假时钟在确定时间点
-  推进，不依赖真实 sleep。
+  设备**被状态机接受的上报**的时刻；`AssignedAt` 记录当前在途尝试的派发时刻。
+  时钟通过 `WithClock` 注入，测试用假时钟在确定时间点推进，不依赖真实 sleep。
+- **存活判定只认新鲜上报**：只有真正新鲜、按顺序到达且被状态机接受
+  （`Accepted=true`）的上报才刷新 `LastSeenAt` 并恢复在线。链路上重放的
+  重复消息（同 Seq）、乱序消息（更小 Seq）、过期尝试的结果（AttemptID/BatchID
+  不匹配）一律被状态机丢弃，**既不刷新存活时间，也不会把已判离线的设备重新
+  变回在线**——设备不会因为偶尔送达的一条旧消息而被误认为还活着。
 - **存活巡检（`Tick` 第一步）**：`now - LastSeenAt > heartbeatTimeout`
-  （`WithHeartbeatTimeout` 配置）即判定设备离线（`Online=false`）。离线设备
-  在 `Dispatch` 闸门处一律被拒绝，任何情况下都不会被派发。设备重新上报心跳
-  或重连事件后自动恢复在线、恢复可投放，无需人工干预。
+  （`WithHeartbeatTimeout` 配置）即判定设备离线（`Online=false`）。注意是
+  **严格超过**：沉默时长恰好等于窗口时不判离线。离线设备在 `Dispatch` 闸门处
+  一律被拒绝（包括同一批次的重复派发），任何情况下都不会被派发。设备重新上报
+  新鲜心跳或重连事件后自动恢复在线、恢复可投放，无需人工干预。
 - **卡批自愈（`Tick` 第二步）**：已派发（`ASSIGNED`/`UPDATING`，即尚无结果）
   但已失联、且 `now - AssignedAt > inFlightTimeout`（`WithInFlightTimeout`
-  配置）的在途记录被回收：
+  配置，同样是**严格超过**，恰好等于窗口不回收）的在途记录被回收：
   - 设备回到 `IDLE`、解除批次归属（`BatchID` 清空）、`AssignedAt` 清零；
   - 批次 `Dispatched` 同步减一，当前阶段名额被释放，可继续投给其他在线设备；
   - 回收在同一存储临界区内完成，且设备被回收后即不在“在途且失联”集合内，
