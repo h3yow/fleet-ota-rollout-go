@@ -21,11 +21,16 @@
   失败率恰好等于阈值时照常投放。熔断只关闭新投放，在途设备的迟到结果仍
   正常入账、收敛并完成回滚。
 - **存活巡检**：编排侧按可配置心跳超时窗口独立判定设备离线（不依赖传输层
-  丢包），离线设备一律不派发；设备重新上报心跳/重连后自动恢复可投放。
-  时钟可注入，测试用假时钟确定性推进，不靠真实 sleep。
+  丢包）。存活账本**只认真正新鲜、按顺序到达且被状态机接受的上报**；链路上
+  重放的重复、乱序或过期尝试的旧消息既不刷新存活时间，也不能把已判离线的
+  设备变回在线。离线设备在任何情况下都不可派发（含对已归属批次的重复派发
+  调用）；静默时长恰好等于窗口时不判离线，严格超过才判。设备真正重新上报
+  心跳/重连后自动恢复可投放。时钟可注入，测试用假时钟确定性推进，不靠真实
+  sleep。
 - **卡批自愈**：已派发但失联且超过在途等待窗口仍无结果的尝试被自动回收，
-  释放阶段名额继续投放其他在线设备；回收幂等可重复触发。被回收设备重连后
-  获得全新尝试，旧尝试的迟到上报不计数、不改状态、不改版本。
+  释放阶段名额继续投放其他在线设备；在途时长恰好等于窗口时不回收，严格
+  超过才回收；回收幂等可重复触发。被回收设备重连后获得全新尝试，旧尝试的
+  迟到上报不计数、不改状态、不改版本。
 - **可复现模拟**：固定随机种子的链路，可配置丢包率、重复率、乱序与离线。
 
 ## 目录
@@ -55,10 +60,14 @@ go test ./internal/rollout/ -v
 go test ./internal/sim/ -v
 
 # 只复现存活巡检 / 卡批自愈 / 熔断口径场景（假时钟推进，无真实 sleep）
-go test ./internal/rollout/ -run 'Liveness|Reclaim|Circuit' -v
+go test ./internal/rollout/ -run 'Liveness|Reclaim|Circuit|StaleReplay' -v
 
-# 2) 端到端演示：三阶段投放、暂停拒绝派发、4 台设备失败触发 40% 熔断、
-#    失败设备自动回滚到 1.0，最后终止批次（重复终止幂等）
+# 演示同款场景（10 台设备、5 台失败、阈值 40%）反复运行，每次都稳定熔断
+go test ./internal/sim/ -run TestDemoScenarioAlwaysCircuitBreaks -race -v
+
+# 2) 端到端演示：三阶段投放、暂停拒绝派发、5 台设备失败（失败率 50%
+#    严格超过 40% 阈值）稳定熔断、失败设备自动回滚到 1.0，最后终止批次
+#    （重复终止幂等）。多跑几次结果一致：每次都熔断并停止后续投放。
 go run ./cmd/demo
 ```
 
@@ -72,7 +81,10 @@ go run ./cmd/demo
 | 部分失败 + 自动回滚 | `device.TestFailureRollbackAndVersionDrift` |
 | 熔断严格超过阈值才触发 | `rollout.TestCircuitBreakStopsRollout`、`batch.TestCircuitBreakAndCompletion`、`sim.TestPartialFailureTriggersCircuitBreak` |
 | 熔断后迟到结果仍收敛回滚 | `rollout.TestCircuitBrokenBatchStillConvergesLateResults` |
+| 演示场景每次运行稳定熔断 | `sim.TestDemoScenarioAlwaysCircuitBreaks` |
 | 存活巡检判离线/恢复 | `rollout.TestLivenessSweepMarksOffline`、`rollout.TestHeartbeatRestoresDispatchability` |
+| 重放旧消息不算存活、不恢复在线 | `rollout.TestStaleReplayDoesNotRefreshLiveness` |
+| 窗口恰好等于不触发、严格超过才触发 | `rollout.TestLivenessAndReclaimStrictBoundary` |
 | 卡批回收释放阶段名额 | `rollout.TestReclaimFreesStuckStageQuota` |
 | 回收后旧尝试迟到上报丢弃 | `rollout.TestReclaimedDeviceFreshAttemptAndLateReportDropped` |
 | 暂停/恢复/终止幂等 | `rollout.TestLifecycleIdempotentAndTerminal`、`batch.TestLifecycleTransitions` |

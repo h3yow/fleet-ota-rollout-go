@@ -39,7 +39,8 @@ type Service struct {
 
 	// now 为编排侧时钟，可注入假时钟以便测试确定性推进时间。
 	now func() time.Time
-	// heartbeatTimeout 心跳超时窗口：超过该窗口没有任何上报即判离线。
+	// heartbeatTimeout 心跳超时窗口：超过该窗口没有任何新鲜上报即判离线
+	// （重复/乱序/过期重放不算存活信号；恰好等于窗口时不判，严格超过才判）。
 	heartbeatTimeout time.Duration
 	// inFlightTimeout 在途等待窗口：派发后失联且超过该窗口无结果即回收名额。
 	inFlightTimeout time.Duration
@@ -128,7 +129,8 @@ func (s *Service) CreateBatch(id string, target model.Version, stages []float64,
 
 // Dispatch 为指定设备派发指定批次。判定全部在同一临界区完成：
 // 批次状态/阶段配额、设备在线性与可派发性、归属唯一性、计数自增。
-// 同一设备重复派发到同一批次为幂等成功，不重复计数。
+// 同一设备重复派发到同一批次为幂等成功，不重复计数；但离线设备在
+// 任何情况下都不可派发——重复调用也会明确返回离线错误而非幂等成功。
 func (s *Service) Dispatch(batchID, deviceID string) error {
 	if s.bm == nil {
 		initService(s)
@@ -142,6 +144,12 @@ func (s *Service) Dispatch(batchID, deviceID string) error {
 			outErr = store.ErrNotFound
 			return
 		}
+		// 离线设备在任何情况下都不可派发——即使是对已归属批次的重复调用，
+		// 也必须明确返回离线错误，而不是幂等成功造成“还能投”的错觉。
+		if !d.Online {
+			outErr = fmt.Errorf("%w: %s", ErrDeviceOffline, d.ID)
+			return
+		}
 		// 幂等：已归属同一批次。
 		if d.BatchID == batchID {
 			idempotent = true
@@ -149,10 +157,6 @@ func (s *Service) Dispatch(batchID, deviceID string) error {
 		}
 		if err := batch.GateDispatch(b); err != nil {
 			outErr = err
-			return
-		}
-		if !d.Online {
-			outErr = fmt.Errorf("%w: %s", ErrDeviceOffline, d.ID)
 			return
 		}
 		if d.Phase.InProgress() {
@@ -190,15 +194,25 @@ func (s *Service) Ingest(ev model.Event) (device.Result, error) {
 	}
 	res := device.Result{}
 	var found bool
+	now := s.now()
 	s.st.WithLock(func(devs map[string]*model.DeviceState, batches map[string]*model.Batch) {
 		d, ok := devs[ev.DeviceID]
 		if !ok {
 			return
 		}
 		found = true
-		// 任何上报都是存活信号：刷新编排侧 LastSeenAt（存活巡检的依据）。
-		d.LastSeenAt = s.now()
 		res = device.ApplyEvent(d, ev)
+		// 存活判定只认真正新鲜、按顺序到达且被状态机接受的上报：
+		// 重复、乱序、过期尝试的重放（Accepted=false）既不刷新 LastSeenAt，
+		// 也不会把已判离线的设备重新变回在线。
+		if res.Accepted {
+			d.LastSeenAt = now
+			s.log("LIVENESS refresh: device=%s lastSeen=%s (fresh in-order %s seq=%d accepted)",
+				d.ID, now.Format("15:04:05.000"), ev.Type, ev.Seq)
+		} else {
+			s.log("LIVENESS ignore: device=%s %s seq=%d rejected (%s), not a liveness signal",
+				d.ID, ev.Type, ev.Seq, res.Reason)
+		}
 
 		b := batches[d.BatchID]
 		// 只有归属批次存在、且事件被接受时才入账。

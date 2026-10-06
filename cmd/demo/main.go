@@ -50,8 +50,11 @@ func main() {
 			ev.DeviceID, ev.Seq, ev.Type, res.Accepted, res.OldPhase, res.NewPhase, res.Reason)
 	}
 
-	// 4 台设备会刷写失败，升级过程中失败率将严格超过 40% 阈值触发熔断。
-	for _, id := range []string{"dev-03", "dev-05", "dev-07", "dev-09"} {
+	// 5 台设备会刷写失败：无论上报到达顺序如何，累计失败率最晚在第 9 台
+	// 出结果时达到 4/9 ≈ 44%，严格超过 40% 阈值，每次运行都稳定熔断。
+	// （若只安排 4 台失败，最终失败率 4/10 恰好等于阈值，按“严格超过才
+	// 熔断”的口径不会熔断，演示结果会随 goroutine 交错顺序时好时坏。）
+	for _, id := range []string{"dev-03", "dev-05", "dev-06", "dev-07", "dev-09"} {
 		agents[id].SetFail(1, true)
 	}
 
@@ -93,7 +96,7 @@ func main() {
 		log.Printf("--- 阶段 %d 结算: state=%s dispatched=%d ok=%d failed=%d rolledBack=%d rate=%.0f%% ---",
 			stage, b.State, b.Dispatched, b.Succeeded, b.Failed, b.RolledBack, b.FailureRate()*100)
 		if b.State == model.BatchCircuitBroken {
-			log.Printf("=== 熔断：失败率 %.0f%% 达到阈值 %.0f%%，停止后续投放 ===",
+			log.Printf("=== 熔断：失败率 %.0f%% 严格超过阈值 %.0f%%，停止后续投放 ===",
 				b.FailureRate()*100, b.FailureThreshold*100)
 			break
 		}

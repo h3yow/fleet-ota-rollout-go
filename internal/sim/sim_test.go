@@ -115,7 +115,7 @@ func TestOfflineReconnectSimulated(t *testing.T) {
 }
 
 // TestPartialFailureTriggersCircuitBreak：多设备并发、部分设备失败，
-// 失败率达到阈值后熔断，计数收敛。
+// 失败率严格超过阈值后熔断，计数收敛。
 func TestPartialFailureTriggersCircuitBreak(t *testing.T) {
 	svc := rollout.New().WithLogger(func(f string, a ...any) { t.Logf("judge: "+f, a...) })
 	const n = 6
@@ -126,7 +126,7 @@ func TestPartialFailureTriggersCircuitBreak(t *testing.T) {
 		_ = svc.RegisterDevice(id, model.Version{Major: 1})
 		agents[i] = sim.NewAgent(id, model.Version{Major: 1}, link)
 	}
-	// 阈值 0.6：3 成 3 败（0.5 尚未触发）→ 第 4 台失败达 0.25? 构造为 2 成 3 败 = 0.6。
+	// 阈值 0.6：2 成 4 败，最终失败率 4/6≈0.67 严格超过阈值触发熔断。
 	_ = svc.CreateBatch("b1", model.Version{Major: 2}, []float64{1}, n, 0.6)
 	_ = svc.StartBatch("b1")
 	for i, a := range agents {
@@ -135,7 +135,8 @@ func TestPartialFailureTriggersCircuitBreak(t *testing.T) {
 		}
 		dd, _ := svc.Snapshot(a.ID(), "b1")
 		a.Assign("b1", model.Version{Major: 2}, dd.AttemptID)
-		// 前两台成功，后四台失败；第 5 台结果入账时失败率 3/5=0.6 触发熔断。
+		// 前两台成功，后四台失败；注意 3/5=0.6 恰好等于阈值不熔断，
+		// 第 4 台失败入账时 4/6≈0.67 严格超过阈值才熔断。
 		if i >= 2 {
 			a.SetFail(dd.AttemptID, true)
 		}
@@ -174,5 +175,70 @@ func TestPartialFailureTriggersCircuitBreak(t *testing.T) {
 	_ = svc.RegisterDevice("dev-extra", model.Version{Major: 1})
 	if err := svc.Dispatch("b1", "dev-extra"); err == nil {
 		t.Fatal("circuit-broken batch must reject dispatch to new device")
+	}
+}
+
+// TestDemoScenarioAlwaysCircuitBreaks：与 cmd/demo 相同的场景（10 台设备、
+// 三阶段 [0.2,0.5,1.0]、阈值 0.4、5 台设备失败、15% 重复投递），并发上报的
+// 交错顺序每次不同，但失败率最晚在第 9 台出结果时达到 4/9≈44%，严格超过
+// 阈值，因此每一轮都必须稳定熔断、停止后续投放。
+func TestDemoScenarioAlwaysCircuitBreaks(t *testing.T) {
+	const n = 10
+	for iter := 0; iter < 8; iter++ {
+		t.Run(fmt.Sprintf("iter-%d", iter), func(t *testing.T) {
+			svc := rollout.New().WithLogger(func(f string, a ...any) { t.Logf("judge: "+f, a...) })
+			link := sim.NewLink(20260924+int64(iter), 0.0, 0.15)
+			agents := make(map[string]*sim.Agent, n)
+			for i := 0; i < n; i++ {
+				id := fmt.Sprintf("dev-%02d", i)
+				if err := svc.RegisterDevice(id, model.Version{Major: 1}); err != nil {
+					t.Fatal(err)
+				}
+				agents[id] = sim.NewAgent(id, model.Version{Major: 1}, link)
+			}
+			if err := svc.CreateBatch("b-canary", model.Version{Major: 2}, []float64{0.2, 0.5, 1.0}, n, 0.4); err != nil {
+				t.Fatal(err)
+			}
+			if err := svc.StartBatch("b-canary"); err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range []string{"dev-03", "dev-05", "dev-06", "dev-07", "dev-09"} {
+				agents[id].SetFail(1, true)
+			}
+			in := ingestor(svc, t)
+			for stage := 0; stage < 3; stage++ {
+				var wg sync.WaitGroup
+				for _, d := range svc.Devices() {
+					_, b := svc.Snapshot(d.ID, "b-canary")
+					if !b.State.Dispatchable() || b.Dispatched >= b.StageQuota() {
+						break
+					}
+					if d.BatchID == "b-canary" {
+						continue
+					}
+					if err := svc.Dispatch("b-canary", d.ID); err != nil {
+						continue
+					}
+					dd, _ := svc.Snapshot(d.ID, "b-canary")
+					agents[d.ID].Assign("b-canary", model.Version{Major: 2}, dd.AttemptID)
+					wg.Add(1)
+					go func(a *sim.Agent) { defer wg.Done(); a.RunUpgrade(in) }(agents[d.ID])
+				}
+				wg.Wait()
+				if _, b := svc.Snapshot("", "b-canary"); b.State == model.BatchCircuitBroken {
+					break
+				}
+			}
+			_, b := svc.Snapshot("", "b-canary")
+			t.Logf("judge: final state=%s dispatched=%d succeeded=%d failed=%d rate=%.2f threshold=%.2f",
+				b.State, b.Dispatched, b.Succeeded, b.Failed, b.FailureRate(), b.FailureThreshold)
+			if b.State != model.BatchCircuitBroken {
+				t.Fatalf("demo scenario must always circuit-break, got %s", b.State)
+			}
+			if b.FailureRate() <= b.FailureThreshold {
+				t.Fatalf("broken batch must have failure rate strictly above threshold: rate=%.2f threshold=%.2f",
+					b.FailureRate(), b.FailureThreshold)
+			}
+		})
 	}
 }
